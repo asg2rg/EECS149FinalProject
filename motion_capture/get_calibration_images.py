@@ -3,9 +3,9 @@ import os
 import time
 
 # Capture parameters
-CAMERA_ID = 2  # Camera ID (usually 0 for built-in webcam)
+CAMERA_ID = 1  # Camera ID (usually 0 for built-in webcam)
 CHESSBOARD_SIZE = (13, 9)  # Number of inner corners per chessboard row and column
-OUTPUT_DIRECTORY = 'calibration_images_victure'  # Directory to save calibration images
+OUTPUT_DIRECTORY = 'calibration_images'  # Directory to save calibration images
 
 IMAGE_RES = (1920,1080)
 
@@ -27,20 +27,19 @@ def capture_calibration_images():
     
     # Open camera
     cap = try_open_camera(CAMERA_ID, cv2.CAP_DSHOW)
+    
     if cap is None:
-        # Fall back to MSMF, then default
-        cap = try_open_camera(CAMERA_ID, cv2.CAP_MSMF) or cv2.VideoCapture(CAMERA_ID)
-    else:
+        cap = try_open_camera(CAMERA_ID, cv2.CAP_MSMF)
+        if cap is None:
+            cap = cv2.VideoCapture(CAMERA_ID)
+    
+    if cap is None or not cap.isOpened():
         print(f"Error: Could not open camera {CAMERA_ID}")
         return
 
     # Set width and height
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_RES[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_RES[1])
-    
-    if not cap.isOpened():
-        print(f"Error: Could not open camera {CAMERA_ID}")
-        return
     
     # Get camera resolution
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -71,7 +70,7 @@ def capture_calibration_images():
         # Draw corners if found
         if ret_chess:
             # Draw and display the corners
-            cv2.drawChessboardCorners(frame, CHESSBOARD_SIZE, corners, ret_chess)
+            #cv2.drawChessboardCorners(frame, CHESSBOARD_SIZE, corners, ret_chess)
             cv2.putText(frame, "Chessboard detected!", (50, 50), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
