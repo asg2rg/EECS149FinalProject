@@ -8,10 +8,11 @@ from cflib.crazyflie.log import LogConfig
 
 import math
 from threading import Thread, Timer  
+import threading
 from pid import PID, PID_RP
 
-CAP    = 5.0
-TH_CAP = 45000
+CAP    = 12.0
+TH_CAP = 47000
 
 URI_DEFAULT = "radio://0/10/250K"
 UDP_PORT    = 5005
@@ -31,26 +32,48 @@ class UDPTracker(object):
     def __init__(self, port):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(("0.0.0.0", port))
-        self._sock.settimeout(0.01)
+        self._sock.setblocking(1)
+        self._sock.settimeout(0.2)
+
+        self.latest_packet = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.receiver_thread = None
 
         self._x = None; self._y = None; self._z = None
-        self._spx = 320.0; self._spy = 240.0; self._spz = 0.40
+        self._spx = 320.0; self._spy = 240.0; self._spz = 0.60
         self._last_rx = 0.0
+    
+    def start_receiver_thread(self):
+        self.running = True
+        t = threading.Thread(target=self._receiver_loop)
+        t.daemon = True
+        t.start()
+        self.receiver_thread = t
+    
+    def _receiver_loop(self):
+        while self.running:
+            try:
+                data, _ = self._sock.recvfrom(1024)
+            except socket.timeout:
+                self.latest_packet = None
+                continue
+            except Exception as e:
+                sys.stdout.write("[UDP] parse error: %s\n" % str(e))
+                continue
+            with self.lock:
+                self.latest_packet = data
+    
+    def stop(self):
+        self.running = False
 
     def find_position(self):
         """Return (x,y,depth) or (None, None, None) if no fresh packet."""
-        latest = None
-        while True:
-            try:
-                data, _ = self._sock.recvfrom(1024)
-                latest = data
-            except socket.timeout:
-                break
-            except Exception as e:
-                sys.stdout.write("[UDP] parse error: %s\n" % str(e))
-                break
-        if latest is not None:
-            xs, ys, zs, spxs, spys = latest.split(",")
+        with self.lock:
+            packet = self.latest_packet
+        
+        if packet is not None:
+            xs, ys, zs, spxs, spys = packet.split(",")
             self._x = float(xs); self._y = float(ys); self._z = float(zs)
             self._spx = float(spxs); self._spy = float(spys)
             self._last_rx = time.time()
@@ -75,11 +98,11 @@ class OverheadPilot(object):
 
         self._rlog = RateLogger(hz=5.0)
 
-        self.r_pid = PID_RP(P=60, D=0.0,  I=0.0, set_point=0.0)
-        self.p_pid = PID_RP(P=60, D=0.0,  I=0.0, set_point=0.0)
-        self.t_pid = PID   (P=10000.0, D=500.0, I=40.0,   set_point=0.0)
+        self.r_pid = PID_RP(P=25, D=5.0,  I=0.0, set_point=0.0)
+        self.p_pid = PID_RP(P=25, D=5.0,  I=0.0, set_point=0.0)
+        self.t_pid = PID   (P=8000.0, D=50.0, I=0.0,   set_point=0.0)
 
-        self.sp_x = 320.0; self.sp_y = 240.0; self.sp_z = 0.60
+        self.sp_x = 320.0; self.sp_y = 240.0; self.sp_z = 0.70
         self.tracker = UDPTracker(UDP_PORT)
 
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -94,6 +117,7 @@ class OverheadPilot(object):
         self.meas_roll  = 0.0
         self.meas_pitch = 0.0
         self.meas_yaw   = 0.0
+        self.tracker.start_receiver_thread()
 
     def connect_crazyflie(self, link_uri):
         print('Connecting to %s' % link_uri)
@@ -147,7 +171,7 @@ class OverheadPilot(object):
 
     def control(self):
         safety = 10
-        period = 1.0 / 50.0  # 50 Hz
+        period = 1.0 / 70.0  # 50 Hz
 
         while True:
             (x, y, depth) = self.tracker.find_position()
@@ -163,8 +187,8 @@ class OverheadPilot(object):
                 thrust = self.t_pid.update(self.sp_z - depth)
 
                 roll_sp   = -roll
-                pitch_sp  = -pitch
-                thrust_sp = thrust + 40000
+                pitch_sp  = pitch
+                thrust_sp = thrust + 41000
 
                 if roll_sp >  CAP: roll_sp =  CAP
                 if roll_sp < -CAP: roll_sp = -CAP
