@@ -4,16 +4,27 @@
 import sys, logging, socket, time, signal
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig 
 
-# Your existing PID classes
+import math
+from threading import Thread, Timer  
 from pid import PID, PID_RP
 
-# Limits (same spirit as reference)
-CAP    = 15.0
-TH_CAP = 55000
+CAP    = 5.0
+TH_CAP = 45000
 
 URI_DEFAULT = "radio://0/10/250K"
 UDP_PORT    = 5005
+
+class RateLogger(object):
+    def __init__(self, hz=5.0):
+        self._period = 1.0 / hz
+        self._tlast = 0.0
+    def log(self, s):
+        t = time.time()
+        if t - self._tlast >= self._period:
+            self._tlast = t
+            sys.stdout.write(s + "\n")
 
 class UDPTracker(object):
     """Minimal UDP front-end that mimics the Kinect API."""
@@ -28,17 +39,21 @@ class UDPTracker(object):
 
     def find_position(self):
         """Return (x,y,depth) or (None, None, None) if no fresh packet."""
-        try:
-            data, _ = self._sock.recvfrom(1024)
-            xs, ys, zs, spxs, spys = data.split(",")
+        latest = None
+        while True:
+            try:
+                data, _ = self._sock.recvfrom(1024)
+                latest = data
+            except socket.timeout:
+                break
+            except Exception as e:
+                sys.stdout.write("[UDP] parse error: %s\n" % str(e))
+                break
+        if latest is not None:
+            xs, ys, zs, spxs, spys = latest.split(",")
             self._x = float(xs); self._y = float(ys); self._z = float(zs)
             self._spx = float(spxs); self._spy = float(spys)
             self._last_rx = time.time()
-        except socket.timeout:
-            pass
-        except Exception as e:
-            sys.stdout.write("[UDP] parse error: %s\n" % str(e))
-
         if self._x is None or self._y is None or self._z is None:
             return (None, None, None)
         if (time.time() - self._last_rx) > 0.5:
@@ -58,12 +73,13 @@ class OverheadPilot(object):
         cflib.crtp.init_drivers()
         self._cf = Crazyflie()
 
-        # Keep reference PID style: roll<-x, pitch<-y, thrust<-z
-        self.r_pid = PID_RP(P=0.05, D=1.0,  I=0.00025, set_point=0.0)
-        self.p_pid = PID_RP(P=0.10, D=1.0,  I=0.00025, set_point=0.0)
-        self.t_pid = PID   (P=30.0, D=500.0, I=40.0,   set_point=0.0)
+        self._rlog = RateLogger(hz=5.0)
 
-        self.sp_x = 320.0; self.sp_y = 240.0; self.sp_z = 0.40
+        self.r_pid = PID_RP(P=60, D=0.0,  I=0.0, set_point=0.0)
+        self.p_pid = PID_RP(P=60, D=0.0,  I=0.0, set_point=0.0)
+        self.t_pid = PID   (P=10000.0, D=500.0, I=40.0,   set_point=0.0)
+
+        self.sp_x = 320.0; self.sp_y = 240.0; self.sp_z = 0.60
         self.tracker = UDPTracker(UDP_PORT)
 
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -71,20 +87,52 @@ class OverheadPilot(object):
         self._cf.connected.add_callback(self._on_connected)
         self._cf.connection_failed.add_callback(self._on_conn_failed)
         self._cf.disconnected.add_callback(self._on_disconnected)
+
         self._connected = False
+        self.is_connected = False  
+
+        self.meas_roll  = 0.0
+        self.meas_pitch = 0.0
+        self.meas_yaw   = 0.0
 
     def connect_crazyflie(self, link_uri):
+        print('Connecting to %s' % link_uri)
         self._cf.open_link(link_uri)
+        self.is_connected = True  
 
     def _on_connected(self, link_uri):
         sys.stdout.write("Connected to %s\n" % link_uri); self._connected = True
 
+        # start stabilizer logging
+        try:
+            lg = LogConfig(name='stabilizer', period_in_ms=20)  # 50 Hz
+            lg.add_variable('stabilizer.roll',  'float')
+            lg.add_variable('stabilizer.pitch', 'float')
+            lg.add_variable('stabilizer.yaw',   'float')
+            self._cf.log.add_config(lg)
+            lg.data_received_cb.add_callback(self._on_log_stab)
+            lg.start()
+        except Exception as e:
+            sys.stdout.write("[LOG] could not start stabilizer log: %s\n" % str(e))
+
+        Thread(target=self.control).start()
+
+
+    def _on_log_stab(self, timestamp, data, logconf):
+        self.meas_roll  = float(data.get('stabilizer.roll',  0.0))
+        self.meas_pitch = float(data.get('stabilizer.pitch', 0.0))
+        self.meas_yaw   = float(data.get('stabilizer.yaw',   0.0))
+
     def _on_conn_failed(self, link_uri, msg):
-        sys.stdout.write("Connection failed on %s: %s\n" % (link_uri, msg)); sys.exit(-1)
+        print('Connection to %s failed: %s' % (link_uri, msg))
+        self.is_connected = False
+        sys.exit(-1)
 
     def _on_disconnected(self, link_uri):
-        sys.stdout.write("Disconnected from %s\n" % link_uri); self._connected = False
-        
+        sys.stdout.write("Disconnected from %s\n" % link_uri)
+        self._connected = False
+        self.is_connected = False
+
     def _p2t(self, percentage):
         """Convert a percentage to raw thrust"""
         return int(65000 * (percentage / 100.0))
@@ -92,7 +140,12 @@ class OverheadPilot(object):
     def set_sp_callback(self, x, y):
         self.sp_x = x; self.sp_y = y
 
-    def control(self, dry=False):
+    # def camera_to_body(self, cam_roll, cam_pitch):
+    #     pitch = math.cos(self.meas_yaw) * -cam_pitch + math.sin(self.meas_yaw) * -cam_roll
+    #     roll = math.sin(self.meas_yaw) * cam_pitch + math.cos(self.meas_yaw) * -cam_roll
+    #     return roll, pitch
+
+    def control(self):
         safety = 10
         period = 1.0 / 50.0  # 50 Hz
 
@@ -105,14 +158,13 @@ class OverheadPilot(object):
                 self.sp_y = self.tracker.get_spy()
                 self.sp_z = self.tracker.get_spz()
 
-                # Keep the reference structure:
                 roll   = self.r_pid.update(self.sp_x - x)
                 pitch  = self.p_pid.update(self.sp_y - y)
                 thrust = self.t_pid.update(self.sp_z - depth)
 
                 roll_sp   = -roll
                 pitch_sp  = -pitch
-                thrust_sp = thrust + 38000
+                thrust_sp = thrust + 40000
 
                 if roll_sp >  CAP: roll_sp =  CAP
                 if roll_sp < -CAP: roll_sp = -CAP
@@ -121,17 +173,18 @@ class OverheadPilot(object):
                 if thrust_sp > TH_CAP: thrust_sp = TH_CAP
                 if thrust_sp < 0:     thrust_sp = 0
 
-                # print self.t_pid.error
-                sys.stdout.write("[CMD] roll=%.2f pitch=%.2f thrust=%d | ex=%.1f ey=%.1f ez=%.3f\n" %
+                sys.stdout.write("[CMD] roll=%.2f pitch=%.2f thrust=%d | "
+                                 "ex=%.1f ey=%.1f ez=%.3f | "
+                                 "meas_roll=%.2f meas_pitch=%.2f meas_yaw=%.2f\n" %
                                  (roll_sp, pitch_sp, int(thrust_sp),
-                                  (self.sp_x - x), (self.sp_y - y), (self.sp_z - depth)))
+                                  (self.sp_x - x), (self.sp_y - y), (self.sp_z - depth),
+                                  self.meas_roll, self.meas_pitch, self.meas_yaw))
 
-                if not dry:
-                    self._cf.commander.send_setpoint(roll_sp, pitch_sp, 0, int(thrust_sp))
+                self._cf.commander.send_setpoint(roll_sp, pitch_sp, 0, int(thrust_sp))
             else:
                 safety -= 1
 
-            if safety < 0 and not dry:
+            if safety < 0:
                 self._cf.commander.send_setpoint(0, 0, 0, 0)
 
             time.sleep(period)
@@ -142,8 +195,6 @@ def main():
     parser.add_argument("-u", "--uri", dest="uri", type=str,
                         default=URI_DEFAULT,
                         help="Crazyflie URI (default: %s)" % URI_DEFAULT)
-    parser.add_argument("-y", "--dry", dest="dry", action="store_true",
-                        help="Do not send commands to Crazyflie")
     parser.add_argument("-d", "--debug", action="store_true", dest="debug",
                         help="Enable debug output")
     args, _ = parser.parse_known_args()
@@ -152,9 +203,10 @@ def main():
     else:          logging.basicConfig(level=logging.INFO)
 
     pilot = OverheadPilot()
-    if not args.dry:
-        pilot.connect_crazyflie(link_uri=args.uri)
-    pilot.control(args.dry)
+    pilot.connect_crazyflie(link_uri=args.uri)
+
+    while pilot.is_connected:
+        time.sleep(1)
 
 if __name__ == "__main__":
     main()
